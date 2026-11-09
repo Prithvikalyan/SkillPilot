@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Literata Variable", ui-serif, Georgia, serif;
+
+  --color-paper: #f4f7f6;
+  --color-surface: #ffffff;
+  --color-ink: #1b2733;
+  --color-muted: #51606d;
+  --color-line: #d9e2e0;
+  --color-line-strong: #b9c7c4;
+  --color-brand: #0f5c63;
+  --color-brand-strong: #0a4349;
+  --color-brand-soft: #e1f0ef;
+  --color-signal: #8a5a0b;
+  --color-signal-soft: #fbf0d9;
+  --color-danger: #a6322a;
+  --color-danger-soft: #fbe9e7;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 3px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+dialog::backdrop { background: rgba(27, 39, 51, 0.5); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Formatting for tutor answers (rendered from Markdown) */
+.answer > * + * { margin-top: 0.75rem; }
+.answer ul { list-style: disc; padding-left: 1.25rem; }
+.answer ol { list-style: decimal; padding-left: 1.25rem; }
+.answer li + li { margin-top: 0.25rem; }
+.answer h1, .answer h2, .answer h3 { font-family: var(--font-serif); font-weight: 600; font-size: 1.05rem; }
+.answer a { color: var(--color-brand); text-decoration: underline; }
+.answer code { background: var(--color-brand-soft); border-radius: 4px; padding: 0.1rem 0.3rem; font-size: 0.9em; }
+.answer pre { background: #16222c; color: #e7eef0; border-radius: 8px; padding: 0.75rem 1rem; overflow-x: auto; font-size: 0.875rem; }
+.answer pre code { background: none; padding: 0; color: inherit; }
+.answer blockquote { border-left: 3px solid var(--color-line-strong); padding-left: 0.75rem; color: var(--color-muted); }
+.answer table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 0.9rem; }
+.answer th, .answer td { border: 1px solid var(--color-line); padding: 0.35rem 0.6rem; text-align: left; }
