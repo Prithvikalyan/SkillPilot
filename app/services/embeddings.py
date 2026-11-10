@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.core.config import settings
 from app.db.connection import SessionLocal
 from app.db.models import TutorMessage, TutorMessageEmbedding
-
+from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 
@@ -160,209 +160,197 @@ def index_unindexed_messages() -> int:
 
 
 
-def hybrid_search(
-    query: str,
-    conversation_id: str = "default",
-    limit: int = 20,
-) -> list[dict]:
-    """Combine semantic and PostgreSQL full-text search using RRF."""
+
+def hybrid_search(query: str, conversation_id: str = "default", limit: int = 20):
+    """
+    Combine BM25 keyword search and pgvector semantic search
+    using Reciprocal Rank Fusion (RRF).
+    """
 
     if not query or not query.strip():
-        raise ValueError("Query must not be empty.")
+        return []
 
-    if not 1 <= limit <= 50:
-        raise ValueError("Limit must be between 1 and 50.")
+    if limit < 1:
+        raise ValueError("limit must be greater than 0")
 
-    # Step 1: Convert the question into an embedding vector.
+    # Tokenize the search query
+    query_tokens = re.findall(r"\b\w+\b", query.lower())
+
+    if not query_tokens:
+        return []
+
+    # Generate query embedding for semantic search
     query_vector = embed_query(query)
 
-    # Step 2: Prepare keyword-search terms.
-    # This creates an OR-separated query, similar to the previous SQL.
-    cleaned_query = re.sub(r"[^\w ]+", " ", query.lower())
-    query_terms = cleaned_query.split()
-    or_query = " OR ".join(query_terms)
+    # Retrieve extra candidates before RRF
+    candidate_limit = max(limit * 4, 20)
 
-    # Step 3: Build a small CTE containing the full-text query
-    # and a normalized form of the user's question.
-    search_term = (
-        select(
-            func.websearch_to_tsquery(
-                "english",
-                or_query,
-            ).label("tsq"),
-            func.regexp_replace(
-                func.lower(query),
-                r"[^[:alnum:]_]+",
-                "",
-                "g",
-            ).label("normalized_query"),
-        )
-        .cte("search_term")
-    )
+    session = SessionLocal()
 
-    # Step 4: Semantic search.
-    # pgvector's cosine_distance() generates the <=> operator.
-    semantic_distance = (
-        TutorMessageEmbedding.embedding.cosine_distance(query_vector)
-    )
+    try:
+        # --------------------------------------------------
+        # 1. Load messages for BM25 keyword search
+        # --------------------------------------------------
 
-    semantic_results = (
-        select(
-            TutorMessageEmbedding.message_id,
-            func.row_number()
-            .over(order_by=semantic_distance)
-            .label("semantic_rank"),
-        )
-        .select_from(TutorMessageEmbedding)
-        .join(
-            TutorMessage,
-            TutorMessage.id == TutorMessageEmbedding.message_id,
-        )
-        .join(search_term, true())
-        .where(
-            TutorMessageEmbedding.conversation_id == conversation_id,
-            func.regexp_replace(
-                func.lower(TutorMessage.content),
-                r"[^[:alnum:]_]+",
-                "",
-                "g",
+        messages = session.execute(
+            select(TutorMessage).where(
+                TutorMessage.conversation_id == conversation_id
             )
-            != search_term.c.normalized_query,
-        )
-        .order_by(semantic_distance.asc())
-        .limit(limit)
-        .cte("semantic_results")
-    )
+        ).scalars().all()
 
-    # Step 5: PostgreSQL full-text keyword search.
-    message_tsvector = func.to_tsvector(
-        "english",
-        TutorMessage.content,
-    )
+        # Tokenize each message
+        bm25_messages = []
+        tokenized_corpus = []
 
-    keyword_rank_score = func.ts_rank_cd(
-        message_tsvector,
-        search_term.c.tsq,
-    )
+        for message in messages:
+            tokens = re.findall(
+                r"\b\w+\b",
+                message.content.lower()
+            )
 
-    keyword_results = (
-        select(
-            TutorMessage.id.label("message_id"),
-            func.row_number()
-            .over(order_by=keyword_rank_score.desc())
-            .label("keyword_rank"),
-        )
-        .select_from(TutorMessage)
-        .join(search_term, true())
-        .where(
-            TutorMessage.conversation_id == conversation_id,
-            message_tsvector.op("@@")(search_term.c.tsq),
-            ~and_(
-                TutorMessage.role == "human",
-                func.regexp_replace(
-                    func.lower(TutorMessage.content),
-                    r"[^[:alnum:]_]+",
-                    "",
-                    "g",
-                )
-                == search_term.c.normalized_query,
-            ),
-        )
-        .order_by(keyword_rank_score.desc())
-        .limit(limit)
-        .cte("keyword_results")
-    )
+            if tokens:
+                bm25_messages.append(message)
+                tokenized_corpus.append(tokens)
 
-    # Step 6: Combine the semantic and keyword rankings.
-    # A message can appear in both result lists.
-    ranked_results = (
-        select(
-            semantic_results.c.message_id,
-            semantic_results.c.semantic_rank,
-            null().cast(BigInteger).label("keyword_rank"),
-        )
-        .union_all(
+        # --------------------------------------------------
+        # 2. BM25 keyword retrieval
+        # --------------------------------------------------
+
+        bm25_results = []
+
+        if tokenized_corpus:
+            bm25 = BM25Okapi(
+                tokenized_corpus,
+                k1=1.5,
+                b=0.75
+            )
+
+            scores = bm25.get_scores(query_tokens)
+
+            # Sort documents by BM25 score
+            ranked_indices = sorted(
+                range(len(scores)),
+                key=lambda index: scores[index],
+                reverse=True
+            )
+
+            bm25_rank = 0
+
+            for index in ranked_indices:
+
+                # Ignore documents that do not match the query
+                if scores[index] <= 0:
+                    continue
+
+                message = bm25_messages[index]
+
+                bm25_rank += 1
+
+                bm25_results.append({
+                    "message": message,
+                    "rank": bm25_rank,
+                    "score": float(scores[index])
+                })
+
+                if bm25_rank >= candidate_limit:
+                    break
+
+        # --------------------------------------------------
+        # 3. Vector semantic retrieval using pgvector
+        # --------------------------------------------------
+
+        semantic_query = (
             select(
-                keyword_results.c.message_id,
-                null().cast(BigInteger).label("semantic_rank"),
-                keyword_results.c.keyword_rank,
+                TutorMessage,
+                TutorMessageEmbedding.embedding.cosine_distance(
+                    query_vector
+                ).label("distance")
             )
+            .join(
+                TutorMessageEmbedding,
+                TutorMessageEmbedding.message_id == TutorMessage.id
+            )
+            .where(
+                TutorMessage.conversation_id == conversation_id
+            )
+            .order_by("distance")
+            .limit(candidate_limit)
         )
-        .cte("ranked_results")
-    )
 
-    # Step 7: Calculate Reciprocal Rank Fusion (RRF) scores.
-    # The constant 60 preserves the original RRF formula.
-    semantic_score = case(
-        (
-            ranked_results.c.semantic_rank.is_not(None),
-            1.0 / (60 + ranked_results.c.semantic_rank),
-        ),
-        else_=0.0,
-    )
+        semantic_rows = session.execute(
+            semantic_query
+        ).all()
 
-    keyword_score = case(
-        (
-            ranked_results.c.keyword_rank.is_not(None),
-            1.0 / (60 + ranked_results.c.keyword_rank),
-        ),
-        else_=0.0,
-    )
+        # --------------------------------------------------
+        # 4. Reciprocal Rank Fusion (RRF)
+        # --------------------------------------------------
 
-    rrf_scores = (
-        select(
-            ranked_results.c.message_id,
-            func.sum(
-                semantic_score + keyword_score
-            ).label("rrf_score"),
-            func.min(
-                ranked_results.c.semantic_rank
-            ).label("semantic_rank"),
-            func.min(
-                ranked_results.c.keyword_rank
-            ).label("keyword_rank"),
+        rrf_constant = 60
+
+        combined_results = {}
+
+        # Add BM25 rankings
+        for result in bm25_results:
+
+            message = result["message"]
+            message_id = message.id
+            rank = result["rank"]
+
+            if message_id not in combined_results:
+                combined_results[message_id] = {
+                    "message_id": message_id,
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                    "rrf_score": 0.0,
+                    "semantic_rank": None,
+                    "bm25_rank": None
+                }
+
+            combined_results[message_id]["rrf_score"] += (
+                1.0 / (rrf_constant + rank)
+            )
+
+            combined_results[message_id]["bm25_rank"] = rank
+
+        # Add semantic rankings
+        for rank, row in enumerate(semantic_rows, start=1):
+
+            message = row[0]
+            message_id = message.id
+
+            if message_id not in combined_results:
+                combined_results[message_id] = {
+                    "message_id": message_id,
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                    "rrf_score": 0.0,
+                    "semantic_rank": None,
+                    "bm25_rank": None
+                }
+
+            combined_results[message_id]["rrf_score"] += (
+                1.0 / (rrf_constant + rank)
+            )
+
+            combined_results[message_id]["semantic_rank"] = rank
+
+        # --------------------------------------------------
+        # 5. Sort using the combined RRF score
+        # --------------------------------------------------
+
+        final_results = sorted(
+            combined_results.values(),
+            key=lambda result: result["rrf_score"],
+            reverse=True
         )
-        .group_by(ranked_results.c.message_id)
-        .cte("rrf_scores")
-    )
 
-    # Step 8: Fetch message details, ordered by the combined RRF score.
-    final_statement = (
-        select(
-            TutorMessage.id.label("message_id"),
-            TutorMessage.role,
-            TutorMessage.content,
-            TutorMessage.created_at,
-            rrf_scores.c.rrf_score,
-            rrf_scores.c.semantic_rank,
-            rrf_scores.c.keyword_rank,
-        )
-        .join(
-            rrf_scores,
-            TutorMessage.id == rrf_scores.c.message_id,
-        )
-        .where(TutorMessage.conversation_id == conversation_id)
-        .order_by(rrf_scores.c.rrf_score.desc())
-        .limit(limit)
-    )
+        return final_results[:limit]
 
-    # Step 9: Execute the SQLAlchemy-built statement.
-    with SessionLocal() as db:
-        rows = db.execute(final_statement).mappings().all()
+    finally:
+        session.close()
 
-    # Step 10: Return ordinary Python dictionaries to the tutor service.
-    return [
-        {
-            "message_id": row["message_id"],
-            "role": row["role"],
-            "content": row["content"],
-            "created_at": row["created_at"],
-            "rrf_score": float(row["rrf_score"]),
-            "semantic_rank": row["semantic_rank"],
-            "keyword_rank": row["keyword_rank"],
-        }
-        for row in rows
-    ]
 
 
 
